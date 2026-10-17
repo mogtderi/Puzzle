@@ -1,8 +1,9 @@
 <!DOCTYPE html>
-<html lang="es">
+<html lang="en">
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="description" content="Hand-gesture photobooth puzzle that runs entirely in the browser (MediaPipe + Canvas)." />
 <title>Puzzle Cam — Gesture Capture</title>
 <link rel="stylesheet" href="css/styles.css" />
 </head>
@@ -16,49 +17,57 @@
 
     <div class="hud-top">
       <div class="brand">PUZZLE·CAM <small>hand-frame capture</small></div>
-      <div class="status-pill">
-        <span id="statusDot" class="status-dot"></span>
-        <span id="statusText">iniciando cámara…</span>
+      <div class="hud-right">
+        <select id="gridSelect" class="hud-select" data-i18n-title="grid.label"></select>
+        <button type="button" id="langBtn" class="hud-btn" data-i18n-title="lang.toggle">ES</button>
+        <div class="status-pill">
+          <span id="statusDot" class="status-dot"></span>
+          <span id="statusText" role="status" aria-live="polite"></span>
+        </div>
       </div>
     </div>
 
     <div id="progressBadge" class="progress-badge">
-      <span id="progressText">0 / 9 piezas colocadas</span>
+      <span id="progressText"></span>
+    </div>
+
+    <div class="hud-bottom">
+      <div class="gesture-key">
+        <span class="item"><span class="swatch pinch"></span><span data-i18n="legend.pinch"></span></span>
+        <span class="item"><span class="swatch drag"></span><span data-i18n="legend.drag"></span></span>
+        <span class="item"><span class="swatch fist"></span><span data-i18n="legend.fist"></span></span>
+      </div>
     </div>
 
     <div id="loadingOverlay">
-      <div class="loader-text" id="loaderText">cargando modelo HandLandmarker…</div>
+      <div class="loader-text" id="loaderText"></div>
       <div class="loader-bar"></div>
-      <button type="button" id="loaderRetry" class="loader-retry hidden">reintentar</button>
+      <button type="button" id="loaderRetry" class="loader-retry hidden" data-i18n="loader.retry"></button>
     </div>
 
-    <div id="errorBanner"></div>
+    <div id="errorBanner" role="alert"></div>
   </div>
 
   <aside id="gallery">
     <div class="gallery-head">
-      <span class="gallery-title">Tira</span>
+      <span class="gallery-title" data-i18n="gallery.title"></span>
       <span class="gallery-count" id="galleryCount">0 / 3</span>
     </div>
 
-    <div class="strip-complete-msg" id="stripCompleteMsg">
-      tira completa — descarga o reinicia para seguir
-    </div>
+    <div class="strip-complete-msg" id="stripCompleteMsg" data-i18n="gallery.complete"></div>
 
     <div id="galleryStrip" class="gallery-strip">
-      <div class="gallery-empty" id="galleryEmpty">
-        Tus rompecabezas completados<br/>aparecerán aquí.
-      </div>
+      <div class="gallery-empty" id="galleryEmpty" data-i18n="gallery.empty"></div>
     </div>
 
     <div class="gallery-actions">
-      <button type="button" id="downloadStripBtn" class="gallery-action-btn" disabled>descargar tira</button>
-      <button type="button" id="resetAllBtn" class="gallery-action-btn gallery-action-btn--danger">reiniciar todo</button>
+      <button type="button" id="downloadStripBtn" class="gallery-action-btn" data-i18n="gallery.download" disabled></button>
+      <button type="button" id="resetAllBtn" class="gallery-action-btn gallery-action-btn--danger" data-i18n="gallery.reset"></button>
     </div>
   </aside>
 
 </div>
 
-<script type="module" src="./app.js"></script>
+<script type="module" src="./js/app.js"></script>
 </body>
 </html>

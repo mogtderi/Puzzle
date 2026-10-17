@@ -1,0 +1,12 @@
+{
+  "name": "puzzle-cam-gesture",
+  "version": "2.0.0",
+  "description": "Hand-gesture photobooth puzzle that runs entirely in the browser (MediaPipe + Canvas). Fork with refactor, smoothing, i18n and tests.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "npx serve .",
+    "test": "node --test"
+  },
+  "license": "MIT"
+}

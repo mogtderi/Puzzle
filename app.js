@@ -1,64 +1,48 @@
-import {
-  FilesetResolver,
-  HandLandmarker,
-} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+import { FilesetResolver, HandLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
 
-const LM = {
-  WRIST: 0,
-  THUMB_TIP: 4,
-  INDEX_MCP: 5,
-  INDEX_TIP: 8,
-  MIDDLE_TIP: 12,
-  RING_TIP: 16,
-  PINKY_TIP: 20,
-  MIDDLE_MCP: 9,
-  RING_MCP: 13,
-  PINKY_MCP: 17,
-};
+import { CONFIG, LM, HAND_CONNECTIONS } from "./config.js";
+import { initLanguage, setLanguage, getLanguage, t, translatePage } from "./i18n.js";
+import { HandTracker, PinchDetector, isFist } from "./gestures.js";
+import { PointFilter } from "./filters.js";
+import { applyPhotoboothEffect } from "./effects.js";
+import { createGallery } from "./gallery.js";
 
-const PINCH_THRESHOLD = 0.055;
-const FRAME_PADDING = 28;
-const FREEZE_HOLD_MS = 250;
-const COUNTDOWN_SECONDS = 3;
-const FIST_HOLD_FRAMES = 12;
-const SNAP_DISTANCE_RATIO = 0.45;
-const GRID = 3;
-const LOAD_TIMEOUT_MS = 20000;
+/* ------------------------------------------------------------------ DOM */
 
-const PHOTOBOOTH_CONTRAST_ALPHA = 1.3;
-const PHOTOBOOTH_BRIGHTNESS_BETA = 10;
-const PHOTOBOOTH_NOISE_STD = 15;
+const $ = (id) => document.getElementById(id);
 
-const HAND_CONNECTIONS = [
-  [0, 1], [1, 2], [2, 3], [3, 4],
-  [0, 5], [5, 6], [6, 7], [7, 8],
-  [5, 9], [9, 10], [10, 11], [11, 12],
-  [9, 13], [13, 14], [14, 15], [15, 16],
-  [13, 17], [17, 18], [18, 19], [19, 20],
-  [0, 17],
-];
-
-const videoEl = document.getElementById("webcam");
-const canvas = document.getElementById("sceneCanvas");
+const videoEl = $("webcam");
+const canvas = $("sceneCanvas");
 const ctx = canvas.getContext("2d", { willReadFrequently: true });
+const stageEl = $("stage");
 
-const statusDot = document.getElementById("statusDot");
-const statusText = document.getElementById("statusText");
-const loadingOverlay = document.getElementById("loadingOverlay");
-const loaderText = document.getElementById("loaderText");
-const loaderRetry = document.getElementById("loaderRetry");
-const errorBanner = document.getElementById("errorBanner");
-const progressBadge = document.getElementById("progressBadge");
-const progressText = document.getElementById("progressText");
+const statusDot = $("statusDot");
+const statusText = $("statusText");
+const loadingOverlay = $("loadingOverlay");
+const loaderText = $("loaderText");
+const loaderRetry = $("loaderRetry");
+const errorBanner = $("errorBanner");
+const progressBadge = $("progressBadge");
+const progressText = $("progressText");
+const gridSelect = $("gridSelect");
+const langBtn = $("langBtn");
+const resetAllBtn = $("resetAllBtn");
+const downloadStripBtn = $("downloadStripBtn");
 
-const galleryStrip = document.getElementById("galleryStrip");
-const galleryEmpty = document.getElementById("galleryEmpty");
-const galleryCount = document.getElementById("galleryCount");
-const downloadStripBtn = document.getElementById("downloadStripBtn");
-const resetAllBtn = document.getElementById("resetAllBtn");
-const stripCompleteMsg = document.getElementById("stripCompleteMsg");
+const gallery = createGallery({
+  stripEl: $("galleryStrip"),
+  emptyEl: $("galleryEmpty"),
+  countEl: $("galleryCount"),
+  downloadBtn: downloadStripBtn,
+  completeMsgEl: $("stripCompleteMsg"),
+});
 
+/* ---------------------------------------------------------------- state */
+
+// "tracking" -> "countdown" -> "puzzle" -> "shattering" -> "tracking"
 let appState = "tracking";
+let handLandmarker = null;
+let selectedGrid = CONFIG.DEFAULT_GRID;
 
 const puzzle = {
   boardBox: null,
@@ -66,379 +50,64 @@ const puzzle = {
   solved: false,
   tileW: 0,
   tileH: 0,
+  grid: CONFIG.DEFAULT_GRID,
+  fullPhotoboothCanvas: null,
 };
 
-const SHATTER_COLS = 6;
-const SHATTER_ROWS = 6;
-const SHATTER_DURATION_MS = 850;
-const shatter = {
-  active: false,
-  startedAt: 0,
-  fragments: [],
-  pendingCanvas: null,
-};
+const countdown = { startedAt: 0 };
+const freezeGate = { holding: false, since: 0 };
+const lastSeenFrame = { box: null, at: 0 };
+const drag = { slot: null, piece: null, offsetX: 0, offsetY: 0 };
+const shatter = { fragments: [], startedAt: 0, lastTick: 0, pendingCanvas: null };
 
-const STRIP_MAX_PHOTOS = 3;
-const galleryEntries = [];
+const tracker = new HandTracker();
+const pinchDetectors = [new PinchDetector(), new PinchDetector()];
+const frameFilters = [new PointFilter(), new PointFilter()];
+const dragFilter = new PointFilter();
 
-function addToGallery(snapshotCanvas) {
-  if (galleryEntries.length >= STRIP_MAX_PHOTOS) return;
+let fistHoldStart = null;
+let lastVideoTime = -1;
+let lastResult = { landmarks: [] };
+let detectErrorShown = false;
 
-  galleryEntries.push({ canvas: snapshotCanvas, time: Date.now() });
-  renderGalleryThumb(snapshotCanvas, galleryEntries.length);
-  galleryCount.textContent = `${galleryEntries.length} / ${STRIP_MAX_PHOTOS}`;
-  if (galleryEmpty) galleryEmpty.style.display = "none";
+/* ---------------------------------------------------------------- status */
 
-  if (galleryEntries.length >= STRIP_MAX_PHOTOS) {
-    showStripComplete();
-  }
+let statusSig = "";
+let statusKey = "status.starting";
+let statusParams = {};
+
+function setStatus(key, params = {}) {
+  const sig = key + JSON.stringify(params);
+  if (sig === statusSig) return;
+  statusSig = sig;
+  statusKey = key;
+  statusParams = params;
+  statusText.textContent = t(key, params);
 }
 
-function isStripFull() {
-  return galleryEntries.length >= STRIP_MAX_PHOTOS;
+function renderStatus() {
+  statusText.textContent = t(statusKey, statusParams);
 }
 
-function showStripComplete() {
-  if (stripCompleteMsg) stripCompleteMsg.classList.add("visible");
-  updateStripDownloadAvailability();
+/* --------------------------------------------------------------- helpers */
+
+function aspect() {
+  return canvas.width / canvas.height;
 }
 
-function hideStripComplete() {
-  if (stripCompleteMsg) stripCompleteMsg.classList.remove("visible");
+function toPixel(landmark) {
+  return { x: landmark.x * canvas.width, y: landmark.y * canvas.height };
 }
 
-function updateStripDownloadAvailability() {
-  if (!downloadStripBtn) return;
-  downloadStripBtn.disabled = galleryEntries.length === 0;
-}
-
-const STRIP_FILE_BORDER = 24;
-const STRIP_FILE_GAP = 16;
-const STRIP_FILE_BG = "#ffffff";
-
-function downloadPhotoStrip() {
-  if (galleryEntries.length === 0) return;
-
-  const entries = galleryEntries;
-  const targetW = entries[0].canvas.width;
-  const scaledHeights = entries.map((entry) =>
-    Math.round(entry.canvas.height * (targetW / entry.canvas.width))
-  );
-
-  const totalH =
-    STRIP_FILE_BORDER * 2 +
-    scaledHeights.reduce((sum, h) => sum + h, 0) +
-    STRIP_FILE_GAP * (entries.length - 1);
-  const totalW = targetW + STRIP_FILE_BORDER * 2;
-
-  const stripCanvas = document.createElement("canvas");
-  stripCanvas.width = totalW;
-  stripCanvas.height = totalH;
-  const stripCtx = stripCanvas.getContext("2d");
-
-  stripCtx.fillStyle = STRIP_FILE_BG;
-  stripCtx.fillRect(0, 0, totalW, totalH);
-
-  let cursorY = STRIP_FILE_BORDER;
-  entries.forEach((entry, i) => {
-    const h = scaledHeights[i];
-    stripCtx.drawImage(entry.canvas, STRIP_FILE_BORDER, cursorY, targetW, h);
-    cursorY += h + STRIP_FILE_GAP;
-  });
-
-  stripCanvas.toBlob((blob) => {
-    if (!blob) return;
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `puzzlecam_tira_${Date.now()}.png`;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    setTimeout(() => URL.revokeObjectURL(url), 4000);
-  }, "image/png");
-}
-
-function resetEverything() {
-  galleryEntries.length = 0;
-  galleryStrip.innerHTML = "";
-  galleryCount.textContent = `0 / ${STRIP_MAX_PHOTOS}`;
-  if (galleryEmpty) {
-    galleryEmpty.style.display = "block";
-    galleryStrip.appendChild(galleryEmpty);
-  }
-  hideStripComplete();
-  updateStripDownloadAvailability();
-  resetPuzzleOnly();
-  statusText.textContent = "todo reiniciado";
-}
-
-function renderGalleryThumb(snapshotCanvas, index) {
-  const print = document.createElement("div");
-  print.className = "print";
-
-  const thumbCanvas = document.createElement("canvas");
-  const THUMB_W = 220;
-  const scale = THUMB_W / snapshotCanvas.width;
-  thumbCanvas.width = THUMB_W;
-  thumbCanvas.height = Math.round(snapshotCanvas.height * scale);
-  thumbCanvas.getContext("2d").drawImage(snapshotCanvas, 0, 0, thumbCanvas.width, thumbCanvas.height);
-
-  const label = document.createElement("div");
-  label.className = "print-label";
-  label.textContent = `#${String(index).padStart(2, "0")}`;
-
-  print.appendChild(thumbCanvas);
-  print.appendChild(label);
-  galleryStrip.insertBefore(print, galleryStrip.firstChild);
-}
-
-function resetPuzzleOnly() {
-  puzzle.boardBox = null;
-  puzzle.pieces = [];
-  puzzle.solved = false;
-  puzzle.fullPhotoboothCanvas = null;
-  appState = "tracking";
-  countdown.active = false;
-  drag.activeHand = null;
-  drag.piece = null;
-  shatter.active = false;
-  shatter.fragments = [];
-  shatter.pendingCanvas = null;
-  fistHoldCounter = 0;
-  lastSeenFrame.box = null;
-  lastSeenFrame.at = 0;
-  updateProgressBadge();
-}
-
-function fitCanvasToWindow() {
-  const stageEl = document.getElementById("stage");
-  const vw = stageEl.clientWidth;
-  const vh = stageEl.clientHeight;
-  const videoAspect = canvas.width / canvas.height;
-  const containerAspect = vw / vh;
-
-  let cssWidth, cssHeight;
-  if (containerAspect > videoAspect) {
-    cssWidth = vw;
-    cssHeight = vw / videoAspect;
-  } else {
-    cssHeight = vh;
-    cssWidth = vh * videoAspect;
-  }
-
-  canvas.style.width = `${cssWidth}px`;
-  canvas.style.height = `${cssHeight}px`;
-}
-
-window.addEventListener("resize", fitCanvasToWindow);
-
-async function initWebcam() {
-  if (!navigator.mediaDevices?.getUserMedia) {
-    throw new Error("Este navegador no soporta getUserMedia.");
-  }
-  const stream = await navigator.mediaDevices.getUserMedia({
-    video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" },
-    audio: false,
-  });
-  videoEl.srcObject = stream;
-
-  await new Promise((resolve) => {
-    videoEl.onloadedmetadata = () => {
-      videoEl.play();
-      resolve();
-    };
-  });
-
-  canvas.width = videoEl.videoWidth;
-  canvas.height = videoEl.videoHeight;
-  fitCanvasToWindow();
-}
-
-function withTimeout(promise, ms, timeoutMessage) {
-  let timer;
-  const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error(timeoutMessage)), ms);
-  });
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
-}
-
-async function initHandLandmarker() {
-  let vision;
-  try {
-    vision = await withTimeout(
-      FilesetResolver.forVisionTasks(
-        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
-      ),
-      LOAD_TIMEOUT_MS,
-      "Tiempo de espera agotado cargando el runtime de MediaPipe (WASM). Revisa tu conexión a internet o si cdn.jsdelivr.net está bloqueado."
-    );
-  } catch (err) {
-    throw err;
-  }
-
-  try {
-    const handLandmarker = await withTimeout(
-      HandLandmarker.createFromOptions(vision, {
-        baseOptions: {
-          modelAssetPath:
-            "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
-          delegate: "GPU",
-        },
-        runningMode: "video",
-        numHands: 2,
-        minHandDetectionConfidence: 0.6,
-        minHandPresenceConfidence: 0.6,
-        minTrackingConfidence: 0.6,
-      }),
-      LOAD_TIMEOUT_MS,
-      "Tiempo de espera agotado descargando el modelo HandLandmarker (~10MB) con GPU."
-    );
-    return handLandmarker;
-  } catch (gpuErr) {
-    console.warn("[PuzzleCam] Falló con delegate GPU, reintentando con CPU…", gpuErr);
-  }
-
-  try {
-    const handLandmarker = await withTimeout(
-      HandLandmarker.createFromOptions(vision, {
-        baseOptions: {
-          modelAssetPath:
-            "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
-          delegate: "CPU",
-        },
-        runningMode: "video",
-        numHands: 2,
-        minHandDetectionConfidence: 0.6,
-        minHandPresenceConfidence: 0.6,
-        minTrackingConfidence: 0.6,
-      }),
-      LOAD_TIMEOUT_MS,
-      "Tiempo de espera agotado descargando el modelo HandLandmarker (~10MB) incluso con CPU. Revisa tu conexión o si storage.googleapis.com está bloqueado en tu red."
-    );
-    return handLandmarker;
-  } catch (cpuErr) {
-    throw cpuErr;
-  }
-}
-
-function dist2D(a, b) {
-  const dx = a.x - b.x;
-  const dy = a.y - b.y;
-  return Math.sqrt(dx * dx + dy * dy);
-}
-
-function isPinching(landmarks) {
-  return dist2D(landmarks[LM.THUMB_TIP], landmarks[LM.INDEX_TIP]) < PINCH_THRESHOLD;
-}
-
-function isFist(landmarks) {
-  const wrist = landmarks[LM.WRIST];
-  const pairs = [
-    [LM.INDEX_TIP, LM.INDEX_MCP],
-    [LM.MIDDLE_TIP, LM.MIDDLE_MCP],
-    [LM.RING_TIP, LM.RING_MCP],
-    [LM.PINKY_TIP, LM.PINKY_MCP],
-  ];
-  let curled = 0;
-  for (const [tipIdx, mcpIdx] of pairs) {
-    if (dist2D(landmarks[tipIdx], wrist) < dist2D(landmarks[mcpIdx], wrist)) curled++;
-  }
-  return curled >= 4;
-}
-
-function toPixel(landmarkNorm) {
-  return { x: landmarkNorm.x * canvas.width, y: landmarkNorm.y * canvas.height };
-}
-
-function mirrorLandmarkX(landmark) {
+function mirrorX(landmark) {
   return { x: 1 - landmark.x, y: landmark.y };
 }
 
-function computeHandFrame(indexTipA, indexTipB) {
-  const a = toPixel(indexTipA);
-  const b = toPixel(indexTipB);
-
-  const minX = Math.min(a.x, b.x) - FRAME_PADDING;
-  const maxX = Math.max(a.x, b.x) + FRAME_PADDING;
-  const minY = Math.min(a.y, b.y) - FRAME_PADDING;
-  const maxY = Math.max(a.y, b.y) + FRAME_PADDING;
-
-  const x = Math.max(0, minX);
-  const y = Math.max(0, minY);
-  const width = Math.min(canvas.width, maxX) - x;
-  const height = Math.min(canvas.height, maxY) - y;
-
-  return { x, y, width, height };
-}
-
-const freezeGate = { holding: false, since: 0 };
-
-const FRAME_GRACE_MS = 450;
-const lastSeenFrame = { box: null, at: 0 };
-
-const countdown = {
-  active: false,
-  startedAt: 0,
-};
-
-function startCountdown(frameBox) {
-  puzzle.boardBox = { ...frameBox };
-  appState = "countdown";
-  countdown.active = true;
-  countdown.startedAt = performance.now();
-}
-
-function drawCountdownOverlay(box) {
-  const elapsed = (performance.now() - countdown.startedAt) / 1000;
-  const remaining = COUNTDOWN_SECONDS - elapsed;
-
-  if (remaining <= 0) {
-    finishCountdownAndCapture(box);
-    return;
-  }
-
-  applyBWInsideBox(box);
-
-  ctx.save();
-  ctx.strokeStyle = "#f5c518";
-  ctx.lineWidth = 3;
-  ctx.strokeRect(box.x, box.y, box.width, box.height);
-
-  const n = Math.ceil(remaining);
-  const cx = box.x + box.width / 2;
-  const cy = box.y + box.height / 2;
-
-  ctx.fillStyle = "rgba(10,10,8,0.45)";
-  ctx.fillRect(box.x, box.y, box.width, box.height);
-
-  ctx.font = `${Math.max(48, Math.min(box.width, box.height) * 0.4)}px 'IBM Plex Mono', monospace`;
-  ctx.fillStyle = "#f5c518";
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-  ctx.fillText(String(n), cx, cy);
-  ctx.restore();
-
-  statusText.textContent = `capturando en ${n}…`;
-}
-
-function gaussianNoise(std) {
-  const u1 = Math.random() || 1e-6;
-  const u2 = Math.random();
-  const z0 = Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
-  return z0 * std;
-}
-
-function applyPhotoboothEffect(imageData) {
-  const d = imageData.data;
-  for (let i = 0; i < d.length; i += 4) {
-    const gray = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
-    let v = gray * PHOTOBOOTH_CONTRAST_ALPHA + PHOTOBOOTH_BRIGHTNESS_BETA;
-    v += gaussianNoise(PHOTOBOOTH_NOISE_STD);
-    v = Math.max(0, Math.min(255, v));
-    d[i] = d[i + 1] = d[i + 2] = v;
-  }
-  return imageData;
+function makeCanvas(w, h) {
+  const c = document.createElement("canvas");
+  c.width = w;
+  c.height = h;
+  return c;
 }
 
 function shuffle(arr) {
@@ -449,199 +118,311 @@ function shuffle(arr) {
   return arr;
 }
 
-function finishCountdownAndCapture(box) {
-  countdown.active = false;
+function withTimeout(promise, ms, message) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
 
-  const mirroredFrame = document.createElement("canvas");
-  mirroredFrame.width = canvas.width;
-  mirroredFrame.height = canvas.height;
-  const mirroredCtx = mirroredFrame.getContext("2d");
-  mirroredCtx.save();
-  mirroredCtx.translate(mirroredFrame.width, 0);
-  mirroredCtx.scale(-1, 1);
-  mirroredCtx.drawImage(videoEl, 0, 0, mirroredFrame.width, mirroredFrame.height);
-  mirroredCtx.restore();
+function fitCanvasToWindow() {
+  const vw = stageEl.clientWidth;
+  const vh = stageEl.clientHeight;
+  const videoAspect = canvas.width / canvas.height;
 
-  const cropCanvas = document.createElement("canvas");
-  cropCanvas.width = Math.max(1, Math.round(box.width));
-  cropCanvas.height = Math.max(1, Math.round(box.height));
-  const cropCtx = cropCanvas.getContext("2d");
-  cropCtx.drawImage(
-    mirroredFrame,
-    box.x, box.y, box.width, box.height,
-    0, 0, cropCanvas.width, cropCanvas.height
+  let cssW, cssH;
+  if (vw / vh > videoAspect) {
+    cssW = vw;
+    cssH = vw / videoAspect;
+  } else {
+    cssH = vh;
+    cssW = vh * videoAspect;
+  }
+  canvas.style.width = `${cssW}px`;
+  canvas.style.height = `${cssH}px`;
+}
+
+/* ---------------------------------------------------------------- camera */
+
+async function initWebcam() {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    throw new Error(t("error.noCameraApi"));
+  }
+
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" },
+    audio: false,
+  });
+
+  // Register the handler BEFORE assigning the stream (avoids missing the event).
+  const metadataReady = new Promise((resolve) => {
+    videoEl.onloadedmetadata = () => {
+      videoEl.play();
+      resolve();
+    };
+  });
+  videoEl.srcObject = stream;
+  await metadataReady;
+
+  canvas.width = videoEl.videoWidth;
+  canvas.height = videoEl.videoHeight;
+  fitCanvasToWindow();
+}
+
+async function createLandmarker(vision, delegate, timeoutMessage) {
+  return withTimeout(
+    HandLandmarker.createFromOptions(vision, {
+      baseOptions: { modelAssetPath: CONFIG.MODEL_URL, delegate },
+      runningMode: "VIDEO",
+      numHands: 2,
+      minHandDetectionConfidence: 0.6,
+      minHandPresenceConfidence: 0.6,
+      minTrackingConfidence: 0.6,
+    }),
+    CONFIG.LOAD_TIMEOUT_MS,
+    timeoutMessage
+  );
+}
+
+async function initHandLandmarker() {
+  const vision = await withTimeout(
+    FilesetResolver.forVisionTasks(CONFIG.WASM_URL),
+    CONFIG.LOAD_TIMEOUT_MS,
+    t("error.wasmTimeout")
   );
 
-  const fullImageData = cropCtx.getImageData(0, 0, cropCanvas.width, cropCanvas.height);
-  applyPhotoboothEffect(fullImageData);
-  cropCtx.putImageData(fullImageData, 0, 0);
+  try {
+    return await createLandmarker(vision, "GPU", t("error.modelTimeoutGpu"));
+  } catch (gpuErr) {
+    console.warn("[PuzzleCam] GPU delegate failed, retrying with CPU…", gpuErr);
+  }
+  return createLandmarker(vision, "CPU", t("error.modelTimeoutCpu"));
+}
 
-  puzzle.fullPhotoboothCanvas = cropCanvas;
+/* -------------------------------------------------------------- capture */
 
-  const tileW = Math.floor(cropCanvas.width / GRID);
-  const tileH = Math.floor(cropCanvas.height / GRID);
+function computeHandFrame(a, b) {
+  const minX = Math.min(a.x, b.x) - CONFIG.FRAME_PADDING;
+  const maxX = Math.max(a.x, b.x) + CONFIG.FRAME_PADDING;
+  const minY = Math.min(a.y, b.y) - CONFIG.FRAME_PADDING;
+  const maxY = Math.max(a.y, b.y) + CONFIG.FRAME_PADDING;
+
+  const x = Math.max(0, minX);
+  const y = Math.max(0, minY);
+  return {
+    x,
+    y,
+    width: Math.min(canvas.width, maxX) - x,
+    height: Math.min(canvas.height, maxY) - y,
+  };
+}
+
+function startCountdown(frameBox) {
+  puzzle.boardBox = { ...frameBox };
+  appState = "countdown";
+  countdown.startedAt = performance.now();
+}
+
+function applyBWInsideBox(box) {
+  const x = Math.max(0, Math.round(box.x));
+  const y = Math.max(0, Math.round(box.y));
+  const w = Math.min(canvas.width - x, Math.round(box.width));
+  const h = Math.min(canvas.height - y, Math.round(box.height));
+  if (w <= 0 || h <= 0) return;
+
+  const region = ctx.getImageData(x, y, w, h);
+  applyPhotoboothEffect(region);
+  ctx.putImageData(region, x, y);
+}
+
+function drawCountdownOverlay(box, now) {
+  const remaining = CONFIG.COUNTDOWN_SECONDS - (now - countdown.startedAt) / 1000;
+  if (remaining <= 0) {
+    finishCountdownAndCapture(box);
+    return;
+  }
+
+  applyBWInsideBox(box);
+
+  const n = Math.ceil(remaining);
+  ctx.save();
+  ctx.strokeStyle = "#f5c518";
+  ctx.lineWidth = 3;
+  ctx.strokeRect(box.x, box.y, box.width, box.height);
+
+  ctx.fillStyle = "rgba(10,10,8,0.45)";
+  ctx.fillRect(box.x, box.y, box.width, box.height);
+
+  ctx.font = `${Math.max(48, Math.min(box.width, box.height) * 0.4)}px 'IBM Plex Mono', monospace`;
+  ctx.fillStyle = "#f5c518";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(String(n), box.x + box.width / 2, box.y + box.height / 2);
+  ctx.restore();
+
+  setStatus("status.countdown", { n });
+}
+
+function finishCountdownAndCapture(box) {
+  // Mirrored snapshot of the current video frame, cropped to the hand frame.
+  const mirrored = makeCanvas(canvas.width, canvas.height);
+  const mctx = mirrored.getContext("2d");
+  mctx.save();
+  mctx.translate(mirrored.width, 0);
+  mctx.scale(-1, 1);
+  mctx.drawImage(videoEl, 0, 0, mirrored.width, mirrored.height);
+  mctx.restore();
+
+  const crop = makeCanvas(Math.max(1, Math.round(box.width)), Math.max(1, Math.round(box.height)));
+  const cropCtx = crop.getContext("2d");
+  cropCtx.drawImage(mirrored, box.x, box.y, box.width, box.height, 0, 0, crop.width, crop.height);
+
+  const imageData = cropCtx.getImageData(0, 0, crop.width, crop.height);
+  applyPhotoboothEffect(imageData);
+  cropCtx.putImageData(imageData, 0, 0);
+
+  puzzle.grid = selectedGrid;
+  puzzle.fullPhotoboothCanvas = crop;
+
+  const grid = puzzle.grid;
+  const tileW = Math.floor(crop.width / grid);
+  const tileH = Math.floor(crop.height / grid);
   const pieces = [];
 
-  for (let row = 0; row < GRID; row++) {
-    for (let col = 0; col < GRID; col++) {
+  for (let row = 0; row < grid; row++) {
+    for (let col = 0; col < grid; col++) {
       const sx = col * tileW;
       const sy = row * tileH;
-      const w = col === GRID - 1 ? cropCanvas.width - sx : tileW;
-      const h = row === GRID - 1 ? cropCanvas.height - sy : tileH;
+      const w = col === grid - 1 ? crop.width - sx : tileW;
+      const h = row === grid - 1 ? crop.height - sy : tileH;
 
-      const pieceCanvas = document.createElement("canvas");
-      pieceCanvas.width = w;
-      pieceCanvas.height = h;
-      pieceCanvas.getContext("2d").drawImage(cropCanvas, sx, sy, w, h, 0, 0, w, h);
+      const pieceCanvas = makeCanvas(w, h);
+      pieceCanvas.getContext("2d").drawImage(crop, sx, sy, w, h, 0, 0, w, h);
 
-      pieces.push({
-        row, col,
-        canvas: pieceCanvas,
-        w, h,
-        x: 0, y: 0,
-        placed: false,
-        dragging: false,
-      });
+      pieces.push({ row, col, canvas: pieceCanvas, w, h, x: 0, y: 0, placed: false, dragging: false, displacing: false });
     }
   }
 
   const slots = [];
-  for (let row = 0; row < GRID; row++) {
-    for (let col = 0; col < GRID; col++) {
+  for (let row = 0; row < grid; row++) {
+    for (let col = 0; col < grid; col++) {
       slots.push({ x: box.x + col * tileW, y: box.y + row * tileH });
     }
   }
   shuffle(slots);
 
-  pieces.forEach((piece, i) => {
-    piece.x = slots[i].x;
-    piece.y = slots[i].y;
-    if (isNearOwnCell(piece, box, tileW, tileH)) {
-      snapPieceToCell(piece, box, tileW, tileH);
-    }
-  });
-
   puzzle.boardBox = box;
   puzzle.pieces = pieces;
   puzzle.tileW = tileW;
   puzzle.tileH = tileH;
+
+  pieces.forEach((piece, i) => {
+    piece.x = slots[i].x;
+    piece.y = slots[i].y;
+    if (isNearOwnCell(piece)) snapPieceToCell(piece);
+  });
+
   puzzle.solved = pieces.every((p) => p.placed);
   appState = "puzzle";
-  fistHoldCounter = 0;
+  fistHoldStart = null;
   updateProgressBadge();
 }
 
-const drag = {
-  activeHand: null,
-  piece: null,
-  offsetX: 0,
-  offsetY: 0,
-};
+/* --------------------------------------------------------------- puzzle */
 
-function isNearOwnCell(piece, box, tileW, tileH) {
-  const correctX = box.x + piece.col * tileW;
-  const correctY = box.y + piece.row * tileH;
-  const dx = piece.x - correctX;
-  const dy = piece.y - correctY;
-  const tolerance = Math.min(tileW, tileH) * SNAP_DISTANCE_RATIO;
-  return Math.sqrt(dx * dx + dy * dy) < tolerance;
+function cellOrigin(row, col) {
+  return { x: puzzle.boardBox.x + col * puzzle.tileW, y: puzzle.boardBox.y + row * puzzle.tileH };
 }
 
-function reconcilePlacedState(box, tileW, tileH) {
-  if (!box || !puzzle.pieces.length) return false;
+function isNearOwnCell(piece) {
+  const target = cellOrigin(piece.row, piece.col);
+  const tolerance = Math.min(puzzle.tileW, puzzle.tileH) * CONFIG.SNAP_DISTANCE_RATIO;
+  return Math.hypot(piece.x - target.x, piece.y - target.y) < tolerance;
+}
+
+function reconcilePlacedState() {
+  if (!puzzle.boardBox || !puzzle.pieces.length) return false;
   for (const piece of puzzle.pieces) {
     if (piece.displacing || piece.dragging) continue;
-    piece.placed = isNearOwnCell(piece, box, tileW, tileH);
+    piece.placed = isNearOwnCell(piece);
   }
   return puzzle.pieces.every((p) => p.placed);
 }
 
-function snapPieceToCell(piece, box, tileW, tileH) {
-  displaceCellOccupant(piece, piece.row, piece.col, box, tileW, tileH);
-  piece.x = box.x + piece.col * tileW;
-  piece.y = box.y + piece.row * tileH;
+function pieceCenterInCell(p, cellX, cellY) {
+  const cx = p.x + p.w / 2;
+  const cy = p.y + p.h / 2;
+  return cx >= cellX && cx < cellX + puzzle.tileW && cy >= cellY && cy < cellY + puzzle.tileH;
+}
+
+function snapPieceToCell(piece) {
+  displaceCellOccupant(piece, piece.row, piece.col);
+  const target = cellOrigin(piece.row, piece.col);
+  piece.x = target.x;
+  piece.y = target.y;
   piece.placed = true;
 }
 
-function displaceCellOccupant(piece, targetRow, targetCol, box, tileW, tileH) {
-  const cellX = box.x + targetCol * tileW;
-  const cellY = box.y + targetRow * tileH;
+function displaceCellOccupant(piece, targetRow, targetCol) {
+  const cell = cellOrigin(targetRow, targetCol);
 
-  const occupant = puzzle.pieces.find((p) => {
-    if (p === piece || p.displacing) return false;
-    const cx = p.x + p.w / 2;
-    const cy = p.y + p.h / 2;
-    return (
-      cx >= cellX && cx < cellX + tileW &&
-      cy >= cellY && cy < cellY + tileH
-    );
-  });
+  const occupant = puzzle.pieces.find(
+    (p) => p !== piece && !p.displacing && pieceCenterInCell(p, cell.x, cell.y)
+  );
   if (!occupant) return;
-
-  if (occupant.row === targetRow && occupant.col === targetCol && occupant.placed) {
-    return;
-  }
+  if (occupant.row === targetRow && occupant.col === targetCol && occupant.placed) return;
 
   occupant.placed = false;
 
   const freeCells = [];
-  for (let row = 0; row < GRID; row++) {
-    for (let col = 0; col < GRID; col++) {
+  for (let row = 0; row < puzzle.grid; row++) {
+    for (let col = 0; col < puzzle.grid; col++) {
       if (row === targetRow && col === targetCol) continue;
-      const cx0 = box.x + col * tileW;
-      const cy0 = box.y + row * tileH;
-      const taken = puzzle.pieces.some((p) => {
-        if (p === occupant || p === piece || p.displacing) return false;
-        const cx = p.x + p.w / 2;
-        const cy = p.y + p.h / 2;
-        return cx >= cx0 && cx < cx0 + tileW && cy >= cy0 && cy < cy0 + tileH;
-      });
+      const o = cellOrigin(row, col);
+      const taken = puzzle.pieces.some(
+        (p) => p !== occupant && p !== piece && !p.displacing && pieceCenterInCell(p, o.x, o.y)
+      );
       if (!taken) freeCells.push({ row, col });
     }
   }
 
-  let targetSlot;
-  if (freeCells.length > 0) {
-    targetSlot = freeCells[Math.floor(Math.random() * freeCells.length)];
-  } else {
-    targetSlot = { row: occupant.row, col: occupant.col };
-  }
+  const slot = freeCells.length
+    ? freeCells[Math.floor(Math.random() * freeCells.length)]
+    : { row: occupant.row, col: occupant.col };
 
-  const jitterX = (Math.random() - 0.5) * tileW * 0.5;
-  const jitterY = (Math.random() - 0.5) * tileH * 0.5;
-  const targetX = box.x + targetSlot.col * tileW + jitterX;
-  const targetY = box.y + targetSlot.row * tileH + jitterY;
-
-  animateDisplacement(occupant, targetX, targetY, box);
+  const o = cellOrigin(slot.row, slot.col);
+  const jitterX = (Math.random() - 0.5) * puzzle.tileW * 0.5;
+  const jitterY = (Math.random() - 0.5) * puzzle.tileH * 0.5;
+  animateDisplacement(occupant, o.x + jitterX, o.y + jitterY);
 }
 
-const DISPLACE_ANIM_MS = 220;
-
-function animateDisplacement(piece, targetX, targetY, box) {
+function animateDisplacement(piece, targetX, targetY) {
   const startX = piece.x;
   const startY = piece.y;
   const startedAt = performance.now();
-
   piece.displacing = true;
 
   function step() {
-    const t = Math.min(1, (performance.now() - startedAt) / DISPLACE_ANIM_MS);
-    const eased = 1 - Math.pow(1 - t, 3);
-
+    const tt = Math.min(1, (performance.now() - startedAt) / CONFIG.DISPLACE_ANIM_MS);
+    const eased = 1 - Math.pow(1 - tt, 3);
     piece.x = startX + (targetX - startX) * eased;
     piece.y = startY + (targetY - startY) * eased;
 
-    if (t < 1) {
+    if (tt < 1) {
       requestAnimationFrame(step);
     } else {
-      piece.x = targetX;
-      piece.y = targetY;
       piece.displacing = false;
-      clampPieceToBoard(piece);
+      if (puzzle.boardBox) clampPieceToBoard(piece);
     }
   }
-
   requestAnimationFrame(step);
+}
+
+function clampPieceToBoard(piece) {
+  const box = puzzle.boardBox;
+  piece.x = Math.min(Math.max(piece.x, box.x), box.x + box.width - piece.w);
+  piece.y = Math.min(Math.max(piece.y, box.y), box.y + box.height - piece.h);
 }
 
 function findNearestPiece(px, py) {
@@ -649,9 +430,7 @@ function findNearestPiece(px, py) {
   let bestDist = Infinity;
   for (const piece of puzzle.pieces) {
     if (piece.displacing) continue;
-    const cx = piece.x + piece.w / 2;
-    const cy = piece.y + piece.h / 2;
-    const d = Math.hypot(px - cx, py - cy);
+    const d = Math.hypot(px - (piece.x + piece.w / 2), py - (piece.y + piece.h / 2));
     if (d < Math.max(piece.w, piece.h) * 0.75 && d < bestDist) {
       best = piece;
       bestDist = d;
@@ -660,55 +439,107 @@ function findNearestPiece(px, py) {
   return best;
 }
 
-function handleDragForHand(handLabel, pinching, indexPx) {
+function handleDragForHand(slot, pinching, rawPx, now) {
   if (pinching) {
-    if (drag.activeHand === null) {
-      const candidate = findNearestPiece(indexPx.x, indexPx.y);
+    if (drag.slot === null) {
+      const candidate = findNearestPiece(rawPx.x, rawPx.y);
       if (candidate) {
-        drag.activeHand = handLabel;
+        dragFilter.reset();
+        dragFilter.filter(rawPx, now);
+        drag.slot = slot;
         drag.piece = candidate;
-        drag.offsetX = indexPx.x - candidate.x;
-        drag.offsetY = indexPx.y - candidate.y;
+        drag.offsetX = rawPx.x - candidate.x;
+        drag.offsetY = rawPx.y - candidate.y;
         candidate.dragging = true;
         candidate.placed = false;
       }
-    } else if (drag.activeHand === handLabel && drag.piece) {
-      drag.piece.x = indexPx.x - drag.offsetX;
-      drag.piece.y = indexPx.y - drag.offsetY;
+    } else if (drag.slot === slot && drag.piece) {
+      const p = dragFilter.filter(rawPx, now);
+      drag.piece.x = p.x - drag.offsetX;
+      drag.piece.y = p.y - drag.offsetY;
     }
-  } else {
-    if (drag.activeHand === handLabel && drag.piece) {
-      const piece = drag.piece;
-      piece.dragging = false;
-      if (isNearOwnCell(piece, puzzle.boardBox, puzzle.tileW, puzzle.tileH)) {
-        snapPieceToCell(piece, puzzle.boardBox, puzzle.tileW, puzzle.tileH);
-      } else {
-        clampPieceToBoard(piece);
-        const box = puzzle.boardBox;
-        const cx = piece.x + piece.w / 2;
-        const cy = piece.y + piece.h / 2;
-        const dropCol = Math.min(
-          GRID - 1,
-          Math.max(0, Math.floor((cx - box.x) / puzzle.tileW))
-        );
-        const dropRow = Math.min(
-          GRID - 1,
-          Math.max(0, Math.floor((cy - box.y) / puzzle.tileH))
-        );
-        displaceCellOccupant(piece, dropRow, dropCol, box, puzzle.tileW, puzzle.tileH);
-      }
-      drag.activeHand = null;
-      drag.piece = null;
-      puzzle.solved = reconcilePlacedState(puzzle.boardBox, puzzle.tileW, puzzle.tileH);
-      updateProgressBadge();
+    return;
+  }
+
+  if (drag.slot === slot && drag.piece) {
+    const piece = drag.piece;
+    piece.dragging = false;
+
+    if (isNearOwnCell(piece)) {
+      snapPieceToCell(piece);
+    } else {
+      clampPieceToBoard(piece);
+      const box = puzzle.boardBox;
+      const last = puzzle.grid - 1;
+      const dropCol = Math.min(last, Math.max(0, Math.floor((piece.x + piece.w / 2 - box.x) / puzzle.tileW)));
+      const dropRow = Math.min(last, Math.max(0, Math.floor((piece.y + piece.h / 2 - box.y) / puzzle.tileH)));
+      displaceCellOccupant(piece, dropRow, dropCol);
     }
+
+    drag.slot = null;
+    drag.piece = null;
+    puzzle.solved = reconcilePlacedState();
+    updateProgressBadge();
   }
 }
 
-function clampPieceToBoard(piece) {
-  const box = puzzle.boardBox;
-  piece.x = Math.min(Math.max(piece.x, box.x), box.x + box.width - piece.w);
-  piece.y = Math.min(Math.max(piece.y, box.y), box.y + box.height - piece.h);
+function resetPuzzleOnly() {
+  puzzle.boardBox = null;
+  puzzle.pieces = [];
+  puzzle.solved = false;
+  puzzle.fullPhotoboothCanvas = null;
+  appState = "tracking";
+  drag.slot = null;
+  drag.piece = null;
+  shatter.fragments = [];
+  shatter.pendingCanvas = null;
+  fistHoldStart = null;
+  lastSeenFrame.box = null;
+  lastSeenFrame.at = 0;
+  freezeGate.holding = false;
+  pinchDetectors.forEach((d) => d.reset());
+  frameFilters.forEach((f) => f.reset());
+  updateProgressBadge();
+}
+
+function resetEverything() {
+  gallery.reset();
+  resetPuzzleOnly();
+  setStatus("status.resetAll");
+}
+
+/* -------------------------------------------------------------- drawing */
+
+function drawVideoFrame() {
+  ctx.save();
+  ctx.translate(canvas.width, 0);
+  ctx.scale(-1, 1);
+  ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
+  ctx.restore();
+}
+
+function drawLiveFrameOverlay(box) {
+  ctx.save();
+  ctx.strokeStyle = "#f5c518";
+  ctx.lineWidth = 3;
+  ctx.strokeRect(box.x, box.y, box.width, box.height);
+
+  const len = 18;
+  ctx.lineWidth = 4;
+  const corners = [
+    [box.x, box.y, 1, 1],
+    [box.x + box.width, box.y, -1, 1],
+    [box.x, box.y + box.height, 1, -1],
+    [box.x + box.width, box.y + box.height, -1, -1],
+  ];
+  for (const [cx, cy, dx, dy] of corners) {
+    ctx.beginPath();
+    ctx.moveTo(cx, cy + len * dy);
+    ctx.lineTo(cx, cy);
+    ctx.lineTo(cx + len * dx, cy);
+    ctx.stroke();
+  }
+  ctx.restore();
 }
 
 function drawBoardAndPieces() {
@@ -722,7 +553,7 @@ function drawBoardAndPieces() {
   ctx.save();
   ctx.strokeStyle = "rgba(245,197,24,0.18)";
   ctx.lineWidth = 1;
-  for (let i = 1; i < GRID; i++) {
+  for (let i = 1; i < puzzle.grid; i++) {
     ctx.beginPath();
     ctx.moveTo(box.x + i * puzzle.tileW, box.y);
     ctx.lineTo(box.x + i * puzzle.tileW, box.y + box.height);
@@ -734,9 +565,9 @@ function drawBoardAndPieces() {
   }
   ctx.restore();
 
-  const sorted = [...puzzle.pieces].sort((a, b) => (a.dragging ? 1 : 0) - (b.dragging ? 1 : 0));
-
-  for (const piece of sorted) {
+  // Dragged piece is drawn last (on top).
+  const ordered = [...puzzle.pieces].sort((a, b) => Number(a.dragging) - Number(b.dragging));
+  for (const piece of ordered) {
     ctx.save();
     if (piece.dragging) {
       ctx.shadowColor = "rgba(245,197,24,0.9)";
@@ -763,77 +594,12 @@ function drawBoardAndPieces() {
     ctx.fillStyle = "#5fae6e";
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    ctx.fillText("¡COMPLETO! — puño para guardar", box.x + box.width / 2, box.y + box.height / 2);
+    ctx.fillText(t("canvas.solved"), box.x + box.width / 2, box.y + box.height / 2, box.width * 0.95);
     ctx.restore();
   }
 }
 
-function updateProgressBadge() {
-  if (appState !== "puzzle") {
-    progressBadge.classList.remove("visible", "solved");
-    return;
-  }
-  const placedCount = puzzle.pieces.filter((p) => p.placed).length;
-  progressText.textContent = `${placedCount} / ${puzzle.pieces.length} piezas colocadas`;
-  progressBadge.classList.add("visible");
-  progressBadge.classList.toggle("solved", puzzle.solved);
-}
-
-function drawVideoFrame() {
-  ctx.save();
-  ctx.translate(canvas.width, 0);
-  ctx.scale(-1, 1);
-  ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
-  ctx.restore();
-}
-
-function applyBWInsideBox(box) {
-  const x = Math.max(0, Math.round(box.x));
-  const y = Math.max(0, Math.round(box.y));
-  const w = Math.min(canvas.width - x, Math.round(box.width));
-  const h = Math.min(canvas.height - y, Math.round(box.height));
-  if (w <= 0 || h <= 0) return;
-
-  const region = ctx.getImageData(x, y, w, h);
-  applyPhotoboothEffect(region);
-  ctx.putImageData(region, x, y);
-}
-
-function drawLiveFrameOverlay(box) {
-  ctx.save();
-  ctx.strokeStyle = "#f5c518";
-  ctx.lineWidth = 3;
-  ctx.strokeRect(box.x, box.y, box.width, box.height);
-
-  const cornerLen = 18;
-  ctx.lineWidth = 4;
-  const corners = [
-    [box.x, box.y, 1, 1],
-    [box.x + box.width, box.y, -1, 1],
-    [box.x, box.y + box.height, 1, -1],
-    [box.x + box.width, box.y + box.height, -1, -1],
-  ];
-  for (const [cx, cy, dx, dy] of corners) {
-    ctx.beginPath();
-    ctx.moveTo(cx, cy + cornerLen * dy);
-    ctx.lineTo(cx, cy);
-    ctx.lineTo(cx + cornerLen * dx, cy);
-    ctx.stroke();
-  }
-  ctx.restore();
-}
-
-function isPointInBoard(px, py, box) {
-  if (!box) return false;
-  return (
-    px >= box.x &&
-    px <= box.x + box.width &&
-    py >= box.y &&
-    py <= box.y + box.height
-  );
-}
-
-function drawHandSkeleton(landmarksPx) {
+function drawHandSkeleton(pts) {
   ctx.save();
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
@@ -843,42 +609,54 @@ function drawHandSkeleton(landmarksPx) {
   ctx.lineWidth = 3;
 
   for (const [iA, iB] of HAND_CONNECTIONS) {
-    const a = landmarksPx[iA];
-    const b = landmarksPx[iB];
     ctx.beginPath();
-    ctx.moveTo(a.x, a.y);
-    ctx.lineTo(b.x, b.y);
+    ctx.moveTo(pts[iA].x, pts[iA].y);
+    ctx.lineTo(pts[iB].x, pts[iB].y);
     ctx.stroke();
   }
 
   ctx.shadowBlur = 6;
   ctx.fillStyle = "white";
-  for (const p of landmarksPx) {
+  for (const p of pts) {
     ctx.beginPath();
     ctx.arc(p.x, p.y, 3.2, 0, Math.PI * 2);
     ctx.fill();
   }
-
   ctx.restore();
 }
 
-function drawHandSkeletonsOverBoard(handsLandmarks, box) {
-  if (!box || !handsLandmarks || handsLandmarks.length === 0) return;
+function isPointInBox(px, py, box) {
+  return px >= box.x && px <= box.x + box.width && py >= box.y && py <= box.y + box.height;
+}
 
-  for (const lm of handsLandmarks) {
-    const landmarksPx = lm.map((pt) => toPixel(mirrorLandmarkX(pt)));
-    const overBoard = landmarksPx.some((p) => isPointInBoard(p.x, p.y, box));
-    if (overBoard) {
-      drawHandSkeleton(landmarksPx);
-    }
+function drawHandSkeletonsOverBoard(hands, box) {
+  if (!box) return;
+  for (const { landmarks } of hands) {
+    const pts = landmarks.map((pt) => toPixel(mirrorX(pt)));
+    if (pts.some((p) => isPointInBox(p.x, p.y, box))) drawHandSkeleton(pts);
   }
 }
 
-function startShatter(sourceCanvas, box) {
-  const cols = SHATTER_COLS;
-  const rows = SHATTER_ROWS;
+function updateProgressBadge() {
+  if (appState !== "puzzle") {
+    progressBadge.classList.remove("visible", "solved");
+    return;
+  }
+  const placed = puzzle.pieces.filter((p) => p.placed).length;
+  progressText.textContent = t("progress", { placed, total: puzzle.pieces.length });
+  progressBadge.classList.add("visible");
+  progressBadge.classList.toggle("solved", puzzle.solved);
+}
+
+/* -------------------------------------------------------------- shatter */
+
+function startShatter(sourceCanvas, box, now) {
+  const cols = CONFIG.SHATTER_COLS;
+  const rows = CONFIG.SHATTER_ROWS;
   const fragW = sourceCanvas.width / cols;
   const fragH = sourceCanvas.height / rows;
+  const boardCx = box.x + box.width / 2;
+  const boardCy = box.y + box.height / 2;
   const fragments = [];
 
   for (let row = 0; row < rows; row++) {
@@ -886,20 +664,11 @@ function startShatter(sourceCanvas, box) {
       const sx = col * fragW;
       const sy = row * fragH;
 
-      const fragCanvas = document.createElement("canvas");
-      fragCanvas.width = Math.ceil(fragW);
-      fragCanvas.height = Math.ceil(fragH);
-      fragCanvas.getContext("2d").drawImage(
-        sourceCanvas,
-        sx, sy, fragW, fragH,
-        0, 0, fragCanvas.width, fragCanvas.height
-      );
+      const fragCanvas = makeCanvas(Math.ceil(fragW), Math.ceil(fragH));
+      fragCanvas.getContext("2d").drawImage(sourceCanvas, sx, sy, fragW, fragH, 0, 0, fragCanvas.width, fragCanvas.height);
 
       const cx = box.x + sx + fragW / 2;
       const cy = box.y + sy + fragH / 2;
-
-      const boardCx = box.x + box.width / 2;
-      const boardCy = box.y + box.height / 2;
       const dirX = cx - boardCx;
       const dirY = cy - boardCy;
       const dirLen = Math.max(1, Math.hypot(dirX, dirY));
@@ -921,32 +690,31 @@ function startShatter(sourceCanvas, box) {
   }
 
   shatter.fragments = fragments;
-  shatter.active = true;
-  shatter.startedAt = performance.now();
+  shatter.startedAt = now;
+  shatter.lastTick = now;
   appState = "shattering";
 }
 
-function updateAndDrawShatter() {
-  const elapsedMs = performance.now() - shatter.startedAt;
-  const t = Math.min(1, elapsedMs / SHATTER_DURATION_MS);
-
-  if (t >= 1) {
+function updateAndDrawShatter(now) {
+  const t01 = Math.min(1, (now - shatter.startedAt) / CONFIG.SHATTER_DURATION_MS);
+  if (t01 >= 1) {
     finishShatter();
     return;
   }
 
-  const dt = 1 / 60;
-  const fadeStart = 0.45;
+  // Real elapsed time (not a fixed 1/60 s), so the animation speed is the same at any FPS.
+  const dt = Math.min(0.05, Math.max(0, (now - shatter.lastTick) / 1000));
+  shatter.lastTick = now;
 
-  ctx.save();
+  const fadeStart = 0.45;
+  const alpha = t01 < fadeStart ? 1 : Math.max(0, 1 - (t01 - fadeStart) / (1 - fadeStart));
+  const scale = 1 - t01 * 0.25;
+
   for (const frag of shatter.fragments) {
     frag.x += frag.vx * dt;
     frag.y += frag.vy * dt;
     frag.vy += frag.gravity * dt;
     frag.rotation += frag.rotationSpeed * dt;
-
-    const alpha = t < fadeStart ? 1 : Math.max(0, 1 - (t - fadeStart) / (1 - fadeStart));
-    const scale = 1 - t * 0.25;
 
     ctx.save();
     ctx.globalAlpha = alpha;
@@ -956,199 +724,208 @@ function updateAndDrawShatter() {
     ctx.drawImage(frag.canvas, -frag.w / 2, -frag.h / 2, frag.w, frag.h);
     ctx.restore();
   }
-  ctx.restore();
 }
 
 function finishShatter() {
-  shatter.active = false;
   shatter.fragments = [];
   if (shatter.pendingCanvas) {
-    addToGallery(shatter.pendingCanvas);
-    statusText.textContent = "¡guardado en la tira!";
+    gallery.add(shatter.pendingCanvas);
+    setStatus("status.saved");
     shatter.pendingCanvas = null;
   }
   resetPuzzleOnly();
 }
 
-function handleFistReset() {
+function handleFistReset(now) {
   if (appState !== "puzzle") {
-    statusText.textContent = "reiniciado (puño)";
+    setStatus("status.resetFist");
     resetPuzzleOnly();
     return;
   }
 
-  const reallySolved = reconcilePlacedState(puzzle.boardBox, puzzle.tileW, puzzle.tileH);
-  puzzle.solved = reallySolved;
-
-  if (reallySolved && puzzle.fullPhotoboothCanvas) {
+  puzzle.solved = reconcilePlacedState();
+  if (puzzle.solved && puzzle.fullPhotoboothCanvas) {
     shatter.pendingCanvas = puzzle.fullPhotoboothCanvas;
-    startShatter(puzzle.fullPhotoboothCanvas, puzzle.boardBox);
+    startShatter(puzzle.fullPhotoboothCanvas, puzzle.boardBox, now);
   } else {
-    statusText.textContent = "reiniciado (puño)";
+    setStatus("status.resetFist");
     resetPuzzleOnly();
   }
 }
 
-let handLandmarker = null;
-let fistHoldCounter = 0;
+/* --------------------------------------------------------- frame logic */
 
-function processResults(result) {
-  if (appState === "shattering") {
-    updateAndDrawShatter();
-    statusText.textContent = "guardando…";
+function drawGraceFrame(now) {
+  if (lastSeenFrame.box && now - lastSeenFrame.at < CONFIG.FRAME_GRACE_MS) {
+    applyBWInsideBox(lastSeenFrame.box);
+    drawLiveFrameOverlay(lastSeenFrame.box);
+  }
+}
+
+function processNoHands(now) {
+  tracker.reset();
+  pinchDetectors.forEach((d) => d.reset());
+  frameFilters.forEach((f) => f.reset());
+  fistHoldStart = null;
+  freezeGate.holding = false;
+  statusDot.className = puzzle.solved ? "status-dot solved" : "status-dot";
+
+  if (drag.slot !== null && drag.piece) {
+    handleDragForHand(drag.slot, false, { x: drag.piece.x, y: drag.piece.y }, now);
+  }
+
+  if (appState === "tracking") {
+    drawGraceFrame(now);
+    setStatus(gallery.isFull() ? "status.stripFull" : "status.searching");
+  } else if (appState === "countdown") {
+    drawCountdownOverlay(puzzle.boardBox, now);
+  } else if (appState === "puzzle") {
+    puzzle.solved = reconcilePlacedState();
+    updateProgressBadge();
+    drawBoardAndPieces();
+    setStatus(puzzle.solved ? "status.solved" : "status.assemble");
+  }
+}
+
+function processTracking(hands, now) {
+  if (gallery.isFull()) {
+    setStatus("status.stripFull");
     return;
   }
 
-  const handsLandmarks = result.landmarks || [];
-  const noHands = handsLandmarks.length === 0;
-
-  if (noHands) {
-    statusDot.className = puzzle.solved ? "status-dot solved" : "status-dot";
-    fistHoldCounter = 0;
+  if (hands.length !== 2) {
     freezeGate.holding = false;
+    frameFilters.forEach((f) => f.reset());
+    drawGraceFrame(now);
+    setStatus("status.tracking");
+    return;
+  }
 
-    if (drag.activeHand && drag.piece) {
-      handleDragForHand(drag.activeHand, false, { x: drag.piece.x, y: drag.piece.y });
+  const points = hands.map((h) => frameFilters[h.slot].filter(toPixel(mirrorX(h.landmarks[LM.INDEX_TIP])), now));
+  const frameBox = computeHandFrame(points[0], points[1]);
+
+  if (frameBox.width > 4 && frameBox.height > 4) {
+    applyBWInsideBox(frameBox);
+    drawLiveFrameOverlay(frameBox);
+    lastSeenFrame.box = frameBox;
+    lastSeenFrame.at = now;
+  }
+
+  const asp = aspect();
+  const bothPinching = hands.map((h) => pinchDetectors[h.slot].update(h.landmarks, asp)).every(Boolean);
+
+  if (bothPinching && frameBox.width > 40 && frameBox.height > 40) {
+    if (!freezeGate.holding) {
+      freezeGate.holding = true;
+      freezeGate.since = now;
     }
+    statusDot.className = "status-dot armed";
+    setStatus("status.hold");
 
-    if (appState === "tracking") {
-      const sinceLastSeen = performance.now() - lastSeenFrame.at;
-      if (lastSeenFrame.box && sinceLastSeen < FRAME_GRACE_MS) {
-        applyBWInsideBox(lastSeenFrame.box);
-        drawLiveFrameOverlay(lastSeenFrame.box);
-      }
-      statusText.textContent = isStripFull()
-        ? "tira completa — descarga o reinicia"
-        : "buscando manos…";
-      return;
+    if (now - freezeGate.since > CONFIG.FREEZE_HOLD_MS) {
+      freezeGate.holding = false;
+      startCountdown(frameBox);
     }
+  } else {
+    freezeGate.holding = false;
+    setStatus("status.tracking");
+  }
+}
 
-    if (appState === "countdown") {
-      drawCountdownOverlay(puzzle.boardBox);
-      return;
-    }
+function processPuzzle(hands, now) {
+  const asp = aspect();
+  const present = new Set();
 
-    if (appState === "puzzle") {
-      puzzle.solved = reconcilePlacedState(puzzle.boardBox, puzzle.tileW, puzzle.tileH);
-      updateProgressBadge();
-      drawBoardAndPieces();
-      statusText.textContent = puzzle.solved
-        ? "¡rompecabezas completo! cierra el puño para guardarlo"
-        : "arma el rompecabezas con pinch";
-      return;
-    }
+  for (const { slot, landmarks } of hands) {
+    present.add(slot);
+    const pinching = pinchDetectors[slot].update(landmarks, asp);
+    const rawPx = toPixel(mirrorX(landmarks[LM.INDEX_TIP]));
+    handleDragForHand(slot, pinching, rawPx, now);
+  }
 
+  // The dragging hand disappeared: drop the piece where it is.
+  if (drag.slot !== null && !present.has(drag.slot) && drag.piece) {
+    handleDragForHand(drag.slot, false, { x: drag.piece.x, y: drag.piece.y }, now);
+  }
+
+  if (!drag.piece) {
+    puzzle.solved = reconcilePlacedState();
+    updateProgressBadge();
+  }
+
+  drawBoardAndPieces();
+  drawHandSkeletonsOverBoard(hands, puzzle.boardBox);
+
+  if (!puzzle.solved) {
+    setStatus("status.assemble");
+  } else if (fistHoldStart !== null) {
+    const pct = Math.min(99, Math.round(((now - fistHoldStart) / CONFIG.FIST_HOLD_MS) * 100));
+    setStatus("status.savingFist", { pct });
+  } else {
+    setStatus("status.solved");
+  }
+}
+
+function processResults(result, now) {
+  if (appState === "shattering") {
+    updateAndDrawShatter(now);
+    setStatus("status.saving");
+    return;
+  }
+
+  const hands = tracker.assign(result.landmarks || []);
+  if (hands.length === 0) {
+    processNoHands(now);
     return;
   }
 
   statusDot.className = puzzle.solved ? "status-dot solved" : "status-dot live";
 
-  const anyFist = handsLandmarks.some((lm) => isFist(lm));
-  const draggingNow = drag.activeHand !== null && drag.piece !== null;
+  // Fist held long enough -> save (if solved) or reset.
+  const asp = aspect();
+  const anyFist = hands.some((h) => isFist(h.landmarks, asp));
+  const draggingNow = drag.slot !== null && drag.piece !== null;
   if (anyFist && !draggingNow && appState !== "tracking") {
-    fistHoldCounter++;
-    if (fistHoldCounter >= FIST_HOLD_FRAMES) {
-      fistHoldCounter = 0;
-      handleFistReset();
+    if (fistHoldStart === null) fistHoldStart = now;
+    if (now - fistHoldStart >= CONFIG.FIST_HOLD_MS) {
+      fistHoldStart = null;
+      handleFistReset(now);
       return;
     }
   } else {
-    fistHoldCounter = 0;
+    fistHoldStart = null;
   }
 
-  if (appState === "tracking") {
-    if (isStripFull()) {
-      statusText.textContent = "tira completa — descarga o reinicia";
-      return;
-    }
-    if (handsLandmarks.length === 2) {
-      const [handA, handB] = handsLandmarks;
-      const indexA = mirrorLandmarkX(handA[LM.INDEX_TIP]);
-      const indexB = mirrorLandmarkX(handB[LM.INDEX_TIP]);
-      const frameBox = computeHandFrame(indexA, indexB);
-
-      if (frameBox.width > 4 && frameBox.height > 4) {
-        applyBWInsideBox(frameBox);
-        drawLiveFrameOverlay(frameBox);
-        lastSeenFrame.box = frameBox;
-        lastSeenFrame.at = performance.now();
-      }
-
-      const bothPinching = isPinching(handA) && isPinching(handB);
-      if (bothPinching && frameBox.width > 40 && frameBox.height > 40) {
-        if (!freezeGate.holding) {
-          freezeGate.holding = true;
-          freezeGate.since = performance.now();
-        }
-        statusDot.className = "status-dot armed";
-        statusText.textContent = "sostén el pinch…";
-
-        if (performance.now() - freezeGate.since > FREEZE_HOLD_MS) {
-          freezeGate.holding = false;
-          startCountdown(frameBox);
-        }
-      } else {
-        freezeGate.holding = false;
-        statusText.textContent = "manos en seguimiento";
-      }
-    } else {
-      freezeGate.holding = false;
-      const sinceLastSeen = performance.now() - lastSeenFrame.at;
-      if (lastSeenFrame.box && sinceLastSeen < FRAME_GRACE_MS) {
-        applyBWInsideBox(lastSeenFrame.box);
-        drawLiveFrameOverlay(lastSeenFrame.box);
-        statusText.textContent = "manos en seguimiento";
-      } else {
-        statusText.textContent = "manos en seguimiento";
-      }
-    }
-    return;
-  }
-
-  if (appState === "countdown") {
-    drawCountdownOverlay(puzzle.boardBox);
-    return;
-  }
-
-  if (appState === "puzzle") {
-    const labelsPresent = new Set();
-    handsLandmarks.forEach((lm, i) => {
-      const label = i === 0 ? "A" : "B";
-      labelsPresent.add(label);
-      const pinching = isPinching(lm);
-      const indexPx = toPixel(mirrorLandmarkX(lm[LM.INDEX_TIP]));
-      handleDragForHand(label, pinching, indexPx);
-    });
-
-    if (drag.activeHand && !labelsPresent.has(drag.activeHand) && drag.piece) {
-      handleDragForHand(drag.activeHand, false, { x: drag.piece.x, y: drag.piece.y });
-    }
-
-    if (!drag.piece) {
-      puzzle.solved = reconcilePlacedState(puzzle.boardBox, puzzle.tileW, puzzle.tileH);
-      updateProgressBadge();
-    }
-
-    drawBoardAndPieces();
-    drawHandSkeletonsOverBoard(handsLandmarks, puzzle.boardBox);
-
-    statusText.textContent = puzzle.solved
-      ? (fistHoldCounter > 0
-          ? `guardando… sostén el puño (${fistHoldCounter}/${FIST_HOLD_FRAMES})`
-          : "¡rompecabezas completo! cierra el puño para guardarlo")
-      : "arma el rompecabezas con pinch";
-  }
+  if (appState === "tracking") processTracking(hands, now);
+  else if (appState === "countdown") drawCountdownOverlay(puzzle.boardBox, now);
+  else if (appState === "puzzle") processPuzzle(hands, now);
 }
 
 function renderLoop() {
   if (videoEl.readyState >= 2 && handLandmarker) {
+    const now = performance.now();
     drawVideoFrame();
-    const nowMs = performance.now();
-    const result = handLandmarker.detectForVideo(videoEl, nowMs);
-    processResults(result);
+
+    // Only run the (expensive) detector when the camera delivered a new frame.
+    if (videoEl.currentTime !== lastVideoTime) {
+      lastVideoTime = videoEl.currentTime;
+      try {
+        lastResult = handLandmarker.detectForVideo(videoEl, now);
+      } catch (err) {
+        console.error("[PuzzleCam] detection error", err);
+        lastResult = { landmarks: [] };
+        if (!detectErrorShown) {
+          detectErrorShown = true;
+          showError(t("error.detect"));
+        }
+      }
+    }
+    processResults(lastResult, now);
   }
   requestAnimationFrame(renderLoop);
 }
+
+/* ------------------------------------------------------- boot / errors */
 
 function showError(message) {
   errorBanner.textContent = message;
@@ -1164,7 +941,7 @@ function showLoaderError(message) {
 function resetLoaderUI() {
   loadingOverlay.classList.remove("hidden");
   loaderText.style.color = "";
-  loaderText.textContent = "cargando modelo HandLandmarker…";
+  loaderText.textContent = t("loader.loading");
   loaderRetry.classList.add("hidden");
   errorBanner.style.display = "none";
 }
@@ -1173,54 +950,84 @@ async function boot() {
   resetLoaderUI();
 
   let settled = false;
-  const watchdogMs = (LOAD_TIMEOUT_MS * 2) + 5000;
   const watchdog = setTimeout(() => {
-    if (!settled) {
-      showLoaderError("La carga está tardando demasiado. Pulsa reintentar o revisa tu conexión.");
-    }
-  }, watchdogMs);
+    if (!settled) showLoaderError(t("error.tooSlow"));
+  }, CONFIG.LOAD_TIMEOUT_MS * 2 + 5000);
 
   try {
-    if (!videoEl.srcObject) {
-      await initWebcam();
-    }
-
+    if (!videoEl.srcObject) await initWebcam();
     handLandmarker = await initHandLandmarker();
 
     settled = true;
     clearTimeout(watchdog);
     loadingOverlay.classList.add("hidden");
-    statusText.textContent = "listo";
+    setStatus("status.ready");
     requestAnimationFrame(renderLoop);
   } catch (err) {
     settled = true;
     clearTimeout(watchdog);
-    if (err && err.name === "NotAllowedError") {
-      showLoaderError("Permiso de cámara denegado. Habilítalo en la configuración del navegador y pulsa reintentar.");
-    } else if (err && err.name === "NotFoundError") {
-      showLoaderError("No se encontró ninguna webcam disponible.");
-    } else {
-      showLoaderError((err && err.message) || "Error iniciando la app.");
-    }
+    if (err?.name === "NotAllowedError") showLoaderError(t("error.cameraDenied"));
+    else if (err?.name === "NotFoundError") showLoaderError(t("error.cameraNotFound"));
+    else showLoaderError(err?.message || t("error.generic"));
   }
 }
 
-loaderRetry.addEventListener("click", () => {
-  boot();
-});
+/* ------------------------------------------------------------- wiring */
 
-if (downloadStripBtn) {
-  downloadStripBtn.addEventListener("click", downloadPhotoStrip);
-  updateStripDownloadAvailability();
-}
-
-if (resetAllBtn) {
-  resetAllBtn.addEventListener("click", () => {
-    const confirmed = window.confirm(
-      "¿Seguro que quieres borrar toda la tira de fotos y empezar de nuevo?"
-    );
-    if (confirmed) resetEverything();
+function setupGridSelect() {
+  gridSelect.innerHTML = "";
+  for (const n of CONFIG.GRID_OPTIONS) {
+    const opt = document.createElement("option");
+    opt.value = String(n);
+    opt.textContent = `${n}×${n}`;
+    if (n === selectedGrid) opt.selected = true;
+    gridSelect.appendChild(opt);
+  }
+  gridSelect.addEventListener("change", () => {
+    selectedGrid = Number(gridSelect.value);
+    gridSelect.blur(); // keep keyboard shortcuts working
   });
 }
 
+function refreshLanguageUi() {
+  translatePage();
+  langBtn.textContent = getLanguage() === "en" ? "ES" : "EN";
+  renderStatus();
+  updateProgressBadge();
+  if (!loaderRetry.classList.contains("hidden")) return; // keep the error message as shown
+  if (!loadingOverlay.classList.contains("hidden")) loaderText.textContent = t("loader.loading");
+}
+
+langBtn.addEventListener("click", () => {
+  setLanguage(getLanguage() === "en" ? "es" : "en");
+  refreshLanguageUi();
+});
+
+loaderRetry.addEventListener("click", boot);
+downloadStripBtn.addEventListener("click", () => gallery.download());
+resetAllBtn.addEventListener("click", () => {
+  if (window.confirm(t("gallery.confirmReset"))) resetEverything();
+});
+
+window.addEventListener("resize", fitCanvasToWindow);
+
+window.addEventListener("keydown", (e) => {
+  if (e.target instanceof HTMLSelectElement || e.ctrlKey || e.metaKey || e.altKey) return;
+  const key = e.key.toLowerCase();
+  if (key === "r" && (appState === "puzzle" || appState === "countdown")) {
+    resetPuzzleOnly();
+    setStatus("status.resetKey");
+  } else if (key === "d") {
+    gallery.download();
+  }
+});
+
+window.addEventListener("pagehide", () => {
+  videoEl.srcObject?.getTracks().forEach((track) => track.stop());
+  handLandmarker?.close();
+});
+
+initLanguage();
+setupGridSelect();
+refreshLanguageUi();
 boot();

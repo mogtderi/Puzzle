@@ -1,125 +1,106 @@
-# PuzzleCam — Gesture Capture
+# PuzzleCam — Gesture Capture (improved fork)
 
-App de fotomatón controlada por gestos manuales que corre completamente en el navegador. Sin instalación, sin backend, sin dependencias que instalar.
+> **This is a fork.** The original project and idea were created by
+> [mishu006](https://github.com/mishu006/Puzzle) and are released under the MIT license.
+> The original concept, gesture design and visual identity belong to the original author.
+> This fork keeps that credit and adds the engineering improvements listed below.
 
----
+A hand-gesture photobooth that runs **entirely in the browser**: frame a photo with both hands, turn it into a sliding-piece puzzle with a black & white photobooth look, solve it with pinch gestures, and collect the results in a downloadable photo strip. No backend, no build step.
 
-## **DESCRIPCIÓN**
+## What this fork changes
 
-PuzzleCam captura una foto usando las manos como "marco", la convierte en un rompecabezas 3x3 con efecto fotográfico en blanco y negro, y permite armarlo usando gestos de pinch. Al completarlo, se guarda en una tira de fotos descargable.
+| Area | Original | This fork |
+|---|---|---|
+| **Structure** | One ~1200-line `app.js` | Split into ES modules: `config`, `gestures`, `filters`, `effects`, `i18n`, `gallery`, `app` |
+| **Pinch detection** | Fixed distance threshold (changes with how far your hand is from the camera) | Thumb–index distance **relative to hand size**, aspect-ratio corrected, with **hysteresis** (separate on/off thresholds) to stop flickering |
+| **Pointer jitter** | Raw landmark positions | **One Euro filter** smoothing for dragged pieces and the capture frame |
+| **Two-hand identity** | Hand order from the detector (can swap between frames and drop a piece) | `HandTracker` keeps a stable slot per hand by matching wrist positions frame to frame |
+| **Performance** | Gaussian noise (`Math.log`/`cos`) computed for every pixel on every frame; detector ran on every screen refresh | Pre-computed noise table; detector only runs when the camera delivers a **new video frame** |
+| **Animations** | Fixed 1/60 s step | Real elapsed time, so the shatter effect runs at the same speed on any display |
+| **Fist gesture** | Counted in frames (speed depends on FPS) | Counted in milliseconds |
+| **Difficulty** | Fixed 3×3 | Selectable **3×3 / 4×4 / 5×5** |
+| **Language** | Spanish only | **English + Spanish**, auto-detected, with a toggle |
+| **Robustness** | — | Webcam metadata handler registered before the stream is attached; detection errors are caught and reported; camera is released on page close; GPU→CPU fallback refactored |
+| **UX** | — | Gesture legend on screen, keyboard shortcuts (`R` reset puzzle, `D` download strip), responsive layout, visible focus styles, `aria-live` status, reduced-motion support |
+| **Quality** | No tests | 20 unit tests for gestures, filters, effects and i18n (`npm test`) |
 
----
+## How it works
 
-## **REQUISITOS DEL SISTEMA**
+1. Show both hands to the camera and **pinch with both** to define the capture frame.
+2. Keep the pinch during the countdown: the photo is taken automatically.
+3. The photo is cut into a grid (3×3 by default) with a black & white photobooth filter.
+4. Rearrange the pieces with **pinch + move**.
+5. When solved, **hold a fist** to save it to the strip (with a shatter animation).
+6. Download the strip once you have 3 puzzles saved.
 
-- **Navegador:** Chrome o Edge (recomendado), Firefox
-- **Hardware:** Cámara web
-- **Conexión a internet:** Requerida para cargar el modelo de MediaPipe (~10MB, solo la primera vez)
-- **Servidor local:** Requerido para ejecutar la app (no se puede abrir como archivo directamente)
+### Gestures
 
----
+| Gesture | Action |
+|---|---|
+| Both hands pinching | Freeze the area and start the countdown |
+| One hand pinching over a piece | Drag the piece |
+| Fist (hold ~0.35 s) | Save a solved puzzle / reset the board |
 
-## **INSTALACIÓN Y CONFIGURACIÓN**
+### Keyboard
 
-### 1. Clonar el repositorio
+| Key | Action |
+|---|---|
+| `R` | Reset the current puzzle |
+| `D` | Download the strip |
+
+## Run it locally
+
+The app uses ES modules and the camera, so it must be served over HTTP (it will not work by opening the file directly).
 
 ```bash
-git clone https://github.com/mishu006/Puzzle.git
+git clone https://github.com/mogtderi/Puzzle.git   # your fork
 cd Puzzle
+npx serve .            # or: python -m http.server 5500
 ```
 
-### 2. Levantar un servidor local
+Open the printed address (e.g. `http://localhost:3000`) and allow camera access.
+An internet connection is needed on first load: the MediaPipe runtime comes from `cdn.jsdelivr.net` and the hand model (~10 MB) from `storage.googleapis.com`.
 
-La app usa módulos ES y acceso a cámara, por lo que necesita correr sobre HTTP.
-
-Instala la extensión [Live Server](https://marketplace.visualstudio.com/items?itemName=ritwickdey.LiveServer) en VS Code y haz clic en **Go Live**.
-
-### 3. Abrir en el navegador
+## Project structure
 
 ```
-http://localhost:5500
+├── index.html
+├── css/styles.css
+├── js/
+│   ├── app.js        # main loop, puzzle logic, rendering
+│   ├── config.js     # every tunable constant (thresholds, timings, grid sizes)
+│   ├── gestures.js   # pinch (hysteresis), fist, hand tracking — pure, tested
+│   ├── filters.js    # One Euro filter — pure, tested
+│   ├── effects.js    # photobooth filter with noise table — pure, tested
+│   ├── i18n.js       # EN/ES strings
+│   └── gallery.js    # photo strip + PNG download
+├── tests/            # node:test unit tests
+└── package.json
 ```
 
-Permite el acceso a la cámara cuando el navegador lo solicite.
+## Tests
 
----
-
-## **ESTRUCTURA DEL PROYECTO**
-
+```bash
+npm test
 ```
-Puzzle/
-├── index.html        # Punto de entrada de la app
-├── app.js            # Lógica completa (tracking, puzzle, galería)
-├── css/
-│   └── styles.css    # Estilos y layout
-└── .gitignore
-```
+Requires Node.js 20+. The tests cover the pure logic (gestures, filters, image effect, translations). The camera and MediaPipe parts need a real browser and webcam and are not covered by automated tests.
 
----
+## Tech stack
 
-## **GESTOS DE CONTROL**
+- [MediaPipe Tasks Vision](https://developers.google.com/mediapipe) `v0.10.14` — hand landmarks
+- Canvas 2D API — rendering, puzzle pieces, photobooth effect
+- Vanilla JavaScript (ES modules), CSS custom properties — no frameworks, no build
 
-| Gesto | Acción |
-|---|---|
-| Ambas manos haciendo pinch | Congelar el área y comenzar cuenta regresiva |
-| Una mano haciendo pinch sobre una pieza | Arrastrar la pieza del puzzle |
-| Puño cerrado (mantener) | Guardar puzzle completado / Reiniciar tablero |
+## Troubleshooting
 
----
+- **Camera does not start:** close other apps using the camera (Teams, Zoom, Discord) and allow permission in the browser.
+- **Model does not load:** check your connection, or whether `cdn.jsdelivr.net` / `storage.googleapis.com` are blocked on your network.
+- **Black screen:** serve the app over HTTP instead of opening `index.html` directly.
+- **Pinch not detected:** improve lighting and keep both hands fully visible. Tune `PINCH_ON_RATIO` / `PINCH_OFF_RATIO` in `js/config.js`.
 
-## **LÓGICA DE LA APLICACIÓN**
+## Credits and license
 
-1. Muestra ambas manos a la cámara y haz pinch para definir el recuadro de captura
-2. Mantén el pinch durante la cuenta regresiva — la foto se toma automáticamente
-3. La foto se divide en un puzzle 3x3 con filtro de fotomatón en blanco y negro
-4. Reorganiza las piezas con gestos de pinch
-5. Al completarlo, cierra el puño para guardar en la tira con animación de fragmentación
-6. Descarga la tira completa cuando tengas 3 puzzles guardados
+- Original project: **mishu006** — https://github.com/mishu006/Puzzle (MIT)
+- Improvements in this fork: **Moghtaderi**
 
----
-
-## **STACK TECNOLÓGICO**
-
-- **[MediaPipe Tasks Vision](https://developers.google.com/mediapipe)** `v0.10.14` — detección de landmarks de la mano
-- **Canvas 2D API** — renderizado, piezas del puzzle, efecto fotomatón
-- **JavaScript (ES Modules)** — sin frameworks
-- **CSS Custom Properties** — theming y layout
-
-Todas las dependencias externas se cargan por CDN. No se requiere ninguna instalación adicional.
-
----
-
-## **GUIA DE SOLUCION DE PROBLEMAS**
-
-### **La cámara no enciende**
-
-Verifica que ninguna otra aplicación (Teams, Zoom, Discord, etc.) esté usando la cámara en segundo plano.
-
-### **La app no carga el modelo**
-
-Verifica tu conexión a internet. El modelo de MediaPipe (~10MB) se descarga desde `storage.googleapis.com` y el runtime desde `cdn.jsdelivr.net`. Si alguno de esos dominios está bloqueado en tu red, la app no podrá iniciar.
-
-### **La app muestra pantalla negra**
-
-Asegúrate de estar abriendo la app desde un servidor local (HTTP), no directamente como archivo desde el explorador de archivos.
-
-### **El gesto de pinch no se detecta**
-
-Asegúrate de tener buena iluminación y que ambas manos sean visibles para la cámara. Acerca más el índice y el pulgar hasta que el punto amarillo en pantalla se active.
-
----
-
-## **COMPATIBILIDAD DE NAVEGADORES**
-
-| Navegador | Soporte |
-|---|---|
-| Chrome / Edge | Recomendado |
-| Firefox | Compatible |
-| Safari | Limitado (puede requerir permisos adicionales) |
-| Movil | Limitado (recomendado en escritorio) |
-
----
-
-## **LICENCIA**
-
-MIT — libre para usar, modificar y compartir.
+Released under the MIT license, same as the original. Keep the original `LICENSE` file and copyright notice when redistributing.
